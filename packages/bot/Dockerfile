@@ -19,6 +19,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
+# sqlite3 / better-sqlite3 npm prebuilds are compiled on Ubuntu 24.04
+# (GLIBC 2.38+). node:22-bookworm-slim is Debian 12 (GLIBC 2.36), so a
+# downloaded .node fails at runtime with:
+#   /lib/x86_64-linux-gnu/libm.so.6: version `GLIBC_2.38' not found
+# Compile the addons against this image's glibc instead.
+ENV npm_config_build_from_source=true
+
 # Install only the bot package's deps. Copying package.json + lockfile first
 # means npm install gets cached on every rebuild that doesn't change deps.
 COPY package.json package-lock.json ./

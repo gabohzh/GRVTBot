@@ -11,6 +11,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
+# Same GLIBC mismatch as the bot image: compile sqlite3 against bookworm
+# instead of using Ubuntu 24.04 prebuilds.
+ENV npm_config_build_from_source=true
+
 COPY package.json package-lock.json ./
 COPY packages/notifier/package.json packages/notifier/
 COPY packages/notifier/tsconfig.json packages/notifier/
