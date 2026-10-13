@@ -6,7 +6,7 @@ import dns from 'dns';
 import http from 'http';
 import https from 'https';
 import dotenv from 'dotenv';
-import { Agent, fetch as undiciFetch } from 'undici';
+import { Agent, fetch as undiciFetch, request as undiciRequest } from 'undici';
 
 dotenv.config();
 
@@ -43,16 +43,48 @@ export function createEmptyAuthState(): AuthState {
   };
 }
 
-// Node 22 / undici treats Set-Cookie as a forbidden header for
-// Headers.get(). The cookie is still on the wire; read it via
-// getSetCookie() (Fetch spec) and fall back to get() for older runtimes.
-function readSetCookieHeader(headers: Headers): string | null {
-  const withGetter = headers as Headers & { getSetCookie?: () => string[] };
-  if (typeof withGetter.getSetCookie === 'function') {
-    const cookies = withGetter.getSetCookie();
-    if (cookies.length > 0) return cookies.join('; ');
+function headerValue(value: string | string[] | undefined): string {
+  if (Array.isArray(value)) return value[0] ?? '';
+  return value ?? '';
+}
+
+function headerJoin(value: string | string[] | undefined): string {
+  if (Array.isArray(value)) return value.join('; ');
+  return value ?? '';
+}
+
+// Fetch hides Set-Cookie (forbidden header). undici.request() returns
+// the raw hop-by-hop headers, which is what GRVT login depends on.
+async function loginWithApiKey(apiKey: string): Promise<{ gravityCookie: string; accountId: string } | null> {
+  const { statusCode, headers, body } = await undiciRequest(
+    'https://edge.grvt.io/auth/api_key/login',
+    {
+      method: 'POST',
+      dispatcher: ipv4Agent,
+      headers: {
+        'content-type': 'application/json',
+        'user-agent': 'GRVT-Grid-Bot/1.0',
+      },
+      body: JSON.stringify({ api_key: apiKey }),
+    }
+  );
+  const responseText = await body.text();
+  if (statusCode < 200 || statusCode >= 300) {
+    console.error(`❌ GRVT login HTTP ${statusCode}: ${responseText.slice(0, 300)}`);
+    return null;
   }
-  return headers.get('set-cookie');
+  const setCookie = headerJoin(headers['set-cookie']);
+  const accountId = headerValue(headers['x-grvt-account-id']);
+  const gravityMatch = setCookie.match(/gravity=([^;]+)/);
+  if (!gravityMatch?.[1] || !accountId) {
+    console.error('❌ GRVT login missing gravity cookie or x-grvt-account-id', {
+      statusCode,
+      hasSetCookie: Boolean(setCookie),
+      accountId: accountId || null,
+    });
+    return null;
+  }
+  return { gravityCookie: gravityMatch[1], accountId };
 }
 
 // Legacy global auth state — used by the singleton GRVTClient path
@@ -73,50 +105,13 @@ export async function authenticateGRVT(): Promise<boolean> {
       throw new Error('GRVT_API_KEY no encontrada en .env');
     }
 
-    // Login request con IPv4 agent
-    const response = await fetchIPv4('https://edge.grvt.io/auth/api_key/login', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'GRVT-Grid-Bot/1.0'
-      },
-      body: JSON.stringify({
-        api_key: apiKey
-      }),
-    });
+    const loggedIn = await loginWithApiKey(apiKey);
+    if (!loggedIn) return false;
 
-    console.log(`📡 Login response: ${response.status}`);
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('❌ Login failed:', errorText);
-      return false;
-    }
-
-    // Extraer cookie y account ID de headers
-    const setCookie = readSetCookieHeader(response.headers);
-    const accountId = response.headers.get('x-grvt-account-id');
-
-    if (!setCookie || !accountId) {
-      console.error('❌ Missing auth headers in response');
-      console.log('Response headers:', Object.fromEntries(response.headers.entries()));
-      return false;
-    }
-
-    // Extraer gravity cookie value
-    const gravityMatch = setCookie.match(/gravity=([^;]+)/);
-    if (!gravityMatch || !gravityMatch[1]) {
-      console.error('❌ Gravity cookie not found in Set-Cookie header');
-      return false;
-    }
-
-    const gravityCookie = gravityMatch[1];
     const now = Date.now();
-    
-    // Actualizar estado auth
     authState = {
-      gravityCookie,
-      accountId,
+      gravityCookie: loggedIn.gravityCookie,
+      accountId: loggedIn.accountId,
       isAuthenticated: true,
       expiresAt: now + (23 * 60 * 60 * 1000), // Expira en 23h (safety margin)
       loginTime: now
@@ -307,28 +302,20 @@ export async function authenticateWithKey(
   state: AuthState
 ): Promise<boolean> {
   try {
-    const response = await fetchIPv4('https://edge.grvt.io/auth/api_key/login', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'GRVT-Grid-Bot/1.0',
-      },
-      body: JSON.stringify({ api_key: apiKey }),
-    });
-    if (!response.ok) return false;
-    const setCookie = readSetCookieHeader(response.headers);
-    const accountId = response.headers.get('x-grvt-account-id');
-    if (!setCookie || !accountId) return false;
-    const gravityMatch = setCookie.match(/gravity=([^;]+)/);
-    if (!gravityMatch?.[1]) return false;
+    const loggedIn = await loginWithApiKey(apiKey);
+    if (!loggedIn) {
+      state.isAuthenticated = false;
+      return false;
+    }
     const now = Date.now();
-    state.gravityCookie = gravityMatch[1];
-    state.accountId = accountId;
+    state.gravityCookie = loggedIn.gravityCookie;
+    state.accountId = loggedIn.accountId;
     state.isAuthenticated = true;
     state.expiresAt = now + 23 * 60 * 60 * 1000;
     state.loginTime = now;
     return true;
-  } catch {
+  } catch (err) {
+    console.error('❌ authenticateWithKey error:', err instanceof Error ? err.message : err);
     state.isAuthenticated = false;
     return false;
   }
