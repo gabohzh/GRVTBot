@@ -43,6 +43,18 @@ export function createEmptyAuthState(): AuthState {
   };
 }
 
+// Node 22 / undici treats Set-Cookie as a forbidden header for
+// Headers.get(). The cookie is still on the wire; read it via
+// getSetCookie() (Fetch spec) and fall back to get() for older runtimes.
+function readSetCookieHeader(headers: Headers): string | null {
+  const withGetter = headers as Headers & { getSetCookie?: () => string[] };
+  if (typeof withGetter.getSetCookie === 'function') {
+    const cookies = withGetter.getSetCookie();
+    if (cookies.length > 0) return cookies.join('; ');
+  }
+  return headers.get('set-cookie');
+}
+
 // Legacy global auth state — used by the singleton GRVTClient path
 // (env-based creds). Multi-tenant clients have their own AuthState.
 let authState: AuthState = createEmptyAuthState();
@@ -82,7 +94,7 @@ export async function authenticateGRVT(): Promise<boolean> {
     }
 
     // Extraer cookie y account ID de headers
-    const setCookie = response.headers.get('set-cookie');
+    const setCookie = readSetCookieHeader(response.headers);
     const accountId = response.headers.get('x-grvt-account-id');
 
     if (!setCookie || !accountId) {
@@ -304,7 +316,7 @@ export async function authenticateWithKey(
       body: JSON.stringify({ api_key: apiKey }),
     });
     if (!response.ok) return false;
-    const setCookie = response.headers.get('set-cookie');
+    const setCookie = readSetCookieHeader(response.headers);
     const accountId = response.headers.get('x-grvt-account-id');
     if (!setCookie || !accountId) return false;
     const gravityMatch = setCookie.match(/gravity=([^;]+)/);
